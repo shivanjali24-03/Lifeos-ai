@@ -1,84 +1,58 @@
-
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt, { type SignOptions } from "jsonwebtoken";
-import { User } from "../models/User.js";
+import { Prisma } from "@prisma/client";
+import { z } from "zod";
+import { env } from "../config/env.js";
+import { prisma } from "../config/database.js";
 
 const router = Router();
 
+const signupSchema = z.object({
+  name: z.string().trim().min(1).max(100),
+  email: z.string().trim().email(),
+  password: z.string().min(8).max(128),
+});
+const loginSchema = z.object({
+  email: z.string().trim().min(1),
+  password: z.string().min(1),
+});
+
 function createToken(userId: string): string {
-  const secret = process.env.JWT_SECRET;
-
-  if (!secret) {
-    throw new Error("JWT_SECRET is missing from .env");
-  }
-
-  const expiresIn = (process.env.JWT_EXPIRES_IN ||
-    "15m") as SignOptions["expiresIn"];
-
-  return jwt.sign({ userId }, secret, { expiresIn });
+  return jwt.sign({ userId }, env.JWT_SECRET, {
+    expiresIn: env.JWT_EXPIRES_IN as SignOptions["expiresIn"],
+  });
 }
 
+const publicUserSelect = { id: true, name: true, email: true } as const;
+
 router.post("/signup", async (req, res) => {
+  const parsed = signupSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({
+      success: false,
+      message: "Name, valid email, and password (8–128 characters) are required.",
+    });
+  }
+
+  const { name, password } = parsed.data;
+  const email = parsed.data.email.toLowerCase();
+
   try {
-    const { name, email, password } = req.body ?? {};
-
-    if (
-      typeof name !== "string" ||
-      typeof email !== "string" ||
-      typeof password !== "string" ||
-      !name.trim() ||
-      !email.trim() ||
-      password.length < 8 ||
-      password.length > 128
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Name, valid email, and password (8–128 characters) are required.",
-      });
-    }
-
-    const normalizedEmail = email.trim().toLowerCase();
-
-    const existingUser = await User.findOne({
-      email: normalizedEmail,
+    const passwordHash = await bcrypt.hash(password, 12);
+    const user = await prisma.user.create({
+      data: { name, email, passwordHash },
+      select: publicUserSelect,
     });
-
-    if (existingUser) {
-      return res.status(409).json({
-        success: false,
-        message: "An account with this email already exists.",
-      });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 12);
-
-    const user = await User.create({
-      name: name.trim(),
-      email: normalizedEmail,
-      password: hashedPassword,
-    });
-
-    const token = createToken(user.id);
 
     return res.status(201).json({
       success: true,
       message: "Account created successfully.",
-      token,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-      },
+      token: createToken(user.id),
+      user,
     });
   } catch (error) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      error.code === 11000
-    ) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
       return res.status(409).json({
         success: false,
         message: "An account with this email already exists.",
@@ -86,60 +60,36 @@ router.post("/signup", async (req, res) => {
     }
 
     console.error("Signup error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Unable to create account.",
-    });
+    return res.status(500).json({ success: false, message: "Unable to create account." });
   }
 });
 
 router.post("/login", async (req, res) => {
+  const parsed = loginSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({ success: false, message: "Email and password are required." });
+  }
+
   try {
-    const { email, password } = req.body ?? {};
+    const user = await prisma.user.findUnique({
+      where: { email: parsed.data.email.trim().toLowerCase() },
+      select: { ...publicUserSelect, passwordHash: true },
+    });
 
-    if (
-      typeof email !== "string" ||
-      typeof password !== "string" ||
-      !email.trim() ||
-      !password
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Email and password are required.",
-      });
+    if (!user || !(await bcrypt.compare(parsed.data.password, user.passwordHash))) {
+      return res.status(401).json({ success: false, message: "Invalid email or password." });
     }
 
-    const user = await User.findOne({
-      email: email.trim().toLowerCase(),
-    }).select("+password");
-
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid email or password.",
-      });
-    }
-
-    const token = createToken(user.id);
-
+    const { passwordHash: _passwordHash, ...publicUser } = user;
     return res.json({
       success: true,
       message: "Login successful.",
-      token,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-      },
+      token: createToken(user.id),
+      user: publicUser,
     });
   } catch (error) {
     console.error("Login error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Unable to log in.",
-    });
+    return res.status(500).json({ success: false, message: "Unable to log in." });
   }
 });
 

@@ -1,52 +1,123 @@
 
 import { Router, type Request, type Response } from "express";
-import { isValidObjectId } from "mongoose";
-import { Task } from "../models/Task.js";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { z } from "zod";
+import { Prisma, type Task } from "@prisma/client";
+import { prisma } from "../config/database.js";
+import {
+  requireAuth,
+  type AuthenticatedRequest,
+} from "../middleware/requireAuth.js";
 
 const router = Router();
 
-type TaskStatus = "pending" | "in-progress" | "completed";
-type TaskPriority = "low" | "medium" | "high";
+router.use(requireAuth);
 
-type TaskUpdates = {
-  title?: string;
-  description?: string;
-  status?: TaskStatus;
-  priority?: TaskPriority;
-  dueDate?: Date | null;
-};
+const titleSchema = z.string().trim().min(1).max(200);
+const descriptionSchema = z.string().max(2000);
+const statusSchema = z.enum(["pending", "in-progress", "completed"]);
+const prioritySchema = z.enum(["low", "medium", "high"]);
+const dueDateSchema = z
+  .string()
+  .datetime({ offset: true })
+  .or(z.literal(""))
+  .nullable();
+const uuidSchema = z.string().uuid();
 
-// Read the authenticated user ID without changing Express's global types.
 function getUserId(req: Request): string | null {
   return (req as AuthenticatedRequest).user?.userId ?? null;
 }
 
-// All routes below require a valid JWT.
-router.use(requireAuth);
+function toApiTask(task: Task) {
+  const status = {
+    PENDING: "pending",
+    IN_PROGRESS: "in-progress",
+    COMPLETED: "completed",
+  } as const;
 
-// GET /api/tasks — fetch only the logged-in user's tasks.
+  const priority = {
+    LOW: "low",
+    MEDIUM: "medium",
+    HIGH: "high",
+  } as const;
+
+  return {
+    id: task.id,
+    title: task.title,
+    description: task.description,
+    status: status[task.status],
+    priority: priority[task.priority],
+    dueDate: task.dueDate?.toISOString() ?? null,
+    userId: task.userId,
+    createdAt: task.createdAt.toISOString(),
+    updatedAt: task.updatedAt.toISOString(),
+  };
+}
+
+function apiStatusToDb(
+  status: z.infer<typeof statusSchema>
+): Task["status"] {
+  const mapping = {
+    pending: "PENDING",
+    "in-progress": "IN_PROGRESS",
+    completed: "COMPLETED",
+  } as const;
+
+  return mapping[status];
+}
+
+function apiPriorityToDb(
+  priority: z.infer<typeof prioritySchema>
+): Task["priority"] {
+  const mapping = {
+    low: "LOW",
+    medium: "MEDIUM",
+    high: "HIGH",
+  } as const;
+
+  return mapping[priority];
+}
+
+function getValidTaskId(
+  req: Request,
+  res: Response
+): string | null {
+  const id: unknown = req.params.id;
+
+  if (typeof id !== "string" || !uuidSchema.safeParse(id).success) {
+    res.status(400).json({
+      success: false,
+      message: "Invalid task ID.",
+    });
+    return null;
+  }
+
+  return id;
+}
+
+// GET /api/tasks
 router.get("/", async (req: Request, res: Response): Promise<void> => {
+  const userId = getUserId(req);
+
+  if (!userId) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication required.",
+    });
+    return;
+  }
+
   try {
-    const userId = getUserId(req);
-
-    if (!userId) {
-      res.status(401).json({
-        success: false,
-        message: "Authentication required.",
-      });
-      return;
-    }
-
-    const tasks = await Task.find({ userId }).sort({ createdAt: -1 });
+    const tasks = await prisma.task.findMany({
+      where: { userId },
+      orderBy: { createdAt: "desc" },
+    });
 
     res.status(200).json({
       success: true,
-      data: tasks,
+      data: tasks.map(toApiTask),
     });
   } catch (error) {
     console.error("Fetch tasks error:", error);
-
     res.status(500).json({
       success: false,
       message: "Failed to fetch tasks.",
@@ -54,91 +125,64 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
   }
 });
 
-// POST /api/tasks — create a task for the logged-in user.
+const createTaskSchema = z.object({
+  title: titleSchema,
+  description: descriptionSchema.optional(),
+  priority: prioritySchema.optional(),
+  dueDate: dueDateSchema.optional(),
+});
+
+// POST /api/tasks
 router.post("/", async (req: Request, res: Response): Promise<void> => {
+  const userId = getUserId(req);
+
+  if (!userId) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication required.",
+    });
+    return;
+  }
+
+  const parsed = createTaskSchema.safeParse(req.body ?? {});
+
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    let message = "Task title is required.";
+
+    if (issue?.path[0] === "title" && issue.code === "too_big") {
+      message = "Task title cannot exceed 200 characters.";
+    } else if (issue?.path[0] === "description") {
+      message = "Description must be a string of at most 2000 characters.";
+    } else if (issue?.path[0] === "priority") {
+      message = "Priority must be low, medium, or high.";
+    } else if (issue?.path[0] === "dueDate") {
+      message = "Please provide a valid due date.";
+    }
+
+    res.status(400).json({ success: false, message });
+    return;
+  }
+
   try {
-    const userId = getUserId(req);
+    const { title, description, priority, dueDate } = parsed.data;
 
-    if (!userId) {
-      res.status(401).json({
-        success: false,
-        message: "Authentication required.",
-      });
-      return;
-    }
-
-    const { title, description, priority, dueDate } = req.body;
-
-    if (typeof title !== "string" || !title.trim()) {
-      res.status(400).json({
-        success: false,
-        message: "Task title is required.",
-      });
-      return;
-    }
-
-    if (title.trim().length > 200) {
-      res.status(400).json({
-        success: false,
-        message: "Task title cannot exceed 200 characters.",
-      });
-      return;
-    }
-
-    if (
-      description !== undefined &&
-      (typeof description !== "string" || description.length > 2000)
-    ) {
-      res.status(400).json({
-        success: false,
-        message: "Description must be a string of at most 2000 characters.",
-      });
-      return;
-    }
-
-    if (
-      priority !== undefined &&
-      !["low", "medium", "high"].includes(priority)
-    ) {
-      res.status(400).json({
-        success: false,
-        message: "Priority must be low, medium, or high.",
-      });
-      return;
-    }
-
-    let parsedDueDate: Date | null = null;
-
-    if (dueDate !== undefined && dueDate !== null && dueDate !== "") {
-      if (
-        typeof dueDate !== "string" ||
-        Number.isNaN(Date.parse(dueDate))
-      ) {
-        res.status(400).json({
-          success: false,
-          message: "Please provide a valid due date.",
-        });
-        return;
-      }
-
-      parsedDueDate = new Date(dueDate);
-    }
-
-    const task = await Task.create({
-      title: title.trim(),
-      description: description?.trim() ?? "",
-      priority: priority ?? "medium",
-      dueDate: parsedDueDate,
-      userId,
+    const task = await prisma.task.create({
+      data: {
+        title,
+        description: description?.trim() ?? "",
+        priority: priority ? apiPriorityToDb(priority) : "MEDIUM",
+        dueDate: dueDate ? new Date(dueDate) : null,
+        userId,
+      },
     });
 
     res.status(201).json({
       success: true,
-      data: task,
+      data: toApiTask(task),
     });
   } catch (error) {
     console.error("Create task error:", error);
-
     res.status(500).json({
       success: false,
       message: "Failed to create task.",
@@ -146,11 +190,25 @@ router.post("/", async (req: Request, res: Response): Promise<void> => {
   }
 });
 
-// PATCH /api/tasks/:id — update only the logged-in user's task.
-router.patch("/:id", async (req: Request, res: Response): Promise<void> => {
-  try {
+const updateTaskSchema = z
+  .object({
+    title: titleSchema.optional(),
+    description: descriptionSchema.optional(),
+    status: statusSchema.optional(),
+    priority: prioritySchema.optional(),
+    dueDate: dueDateSchema.optional(),
+  })
+  .strict()
+  .refine(
+    (data) => Object.keys(data).length > 0,
+    "Provide at least one valid field to update."
+  );
+
+// PATCH /api/tasks/:id
+router.patch(
+  "/:id",
+  async (req: Request, res: Response): Promise<void> => {
     const userId = getUserId(req);
-    const taskId = req.params.id;
 
     if (!userId) {
       res.status(401).json({
@@ -160,140 +218,93 @@ router.patch("/:id", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    if (!isValidObjectId(taskId)) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid task ID.",
-      });
+    const id = getValidTaskId(req, res);
+    if (!id) return;
+
+    const parsed = updateTaskSchema.safeParse(req.body ?? {});
+
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      let message = "Provide at least one valid field to update.";
+
+      if (issue?.path[0] === "title") {
+        message = "Title must be between 1 and 200 characters.";
+      } else if (issue?.path[0] === "description") {
+        message = "Description must be a string of at most 2000 characters.";
+      } else if (issue?.path[0] === "status") {
+        message = "Invalid task status.";
+      } else if (issue?.path[0] === "priority") {
+        message = "Invalid task priority.";
+      } else if (issue?.path[0] === "dueDate") {
+        message = "Please provide a valid due date.";
+      }
+
+      res.status(400).json({ success: false, message });
       return;
     }
 
-    const { title, description, status, priority, dueDate } = req.body;
+    try {
+      const input = parsed.data;
+      const data: Prisma.TaskUpdateInput = {};
 
-    // Allow only explicitly supported fields.
-    const updates: TaskUpdates = {};
-
-    if (title !== undefined) {
-      if (
-        typeof title !== "string" ||
-        !title.trim() ||
-        title.trim().length > 200
-      ) {
-        res.status(400).json({
-          success: false,
-          message: "Title must be between 1 and 200 characters.",
-        });
-        return;
+      if (input.title !== undefined) {
+        data.title = input.title;
       }
 
-      updates.title = title.trim();
-    }
-
-    if (description !== undefined) {
-      if (
-        typeof description !== "string" ||
-        description.length > 2000
-      ) {
-        res.status(400).json({
-          success: false,
-          message: "Description must be a string of at most 2000 characters.",
-        });
-        return;
+      if (input.description !== undefined) {
+        data.description = input.description.trim();
       }
 
-      updates.description = description.trim();
-    }
-
-    if (status !== undefined) {
-      if (
-        !["pending", "in-progress", "completed"].includes(status)
-      ) {
-        res.status(400).json({
-          success: false,
-          message: "Invalid task status.",
-        });
-        return;
+      if (input.status !== undefined) {
+        data.status = apiStatusToDb(input.status);
       }
 
-      updates.status = status as TaskStatus;
-    }
-
-    if (priority !== undefined) {
-      if (!["low", "medium", "high"].includes(priority)) {
-        res.status(400).json({
-          success: false,
-          message: "Invalid task priority.",
-        });
-        return;
+      if (input.priority !== undefined) {
+        data.priority = apiPriorityToDb(input.priority);
       }
 
-      updates.priority = priority as TaskPriority;
-    }
-
-    if (dueDate !== undefined) {
-      if (dueDate === null || dueDate === "") {
-        updates.dueDate = null;
-      } else if (
-        typeof dueDate === "string" &&
-        !Number.isNaN(Date.parse(dueDate))
-      ) {
-        updates.dueDate = new Date(dueDate);
-      } else {
-        res.status(400).json({
-          success: false,
-          message: "Please provide a valid due date.",
-        });
-        return;
+      if (input.dueDate !== undefined) {
+        data.dueDate = input.dueDate ? new Date(input.dueDate) : null;
       }
-    }
 
-    if (Object.keys(updates).length === 0) {
-      res.status(400).json({
-        success: false,
-        message: "Provide at least one valid field to update.",
+      // Verify ownership before updating.
+      const existingTask = await prisma.task.findFirst({
+        where: { id, userId },
       });
-      return;
-    }
 
-    const task = await Task.findOneAndUpdate(
-      {
-        _id: taskId,
-        userId,
-      },
-      updates,
-      {
-        new: true,
-        runValidators: true,
+      if (!existingTask) {
+        res.status(404).json({
+          success: false,
+          message: "Task not found.",
+        });
+        return;
       }
-    );
 
-    if (!task) {
-      res.status(404).json({
-        success: false,
-        message: "Task not found.",
+      // id is unique; ownership was verified above.
+      const updatedTask = await prisma.task.update({
+        where: { id },
+        data,
       });
-      return;
+
+      res.status(200).json({
+        success: true,
+        data: toApiTask(updatedTask),
+      });
+    } catch (error) {
+      console.error("Update task error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to update task.",
+      });
     }
-
-    res.status(200).json({
-      success: true,
-      data: task,
-    });
-  } catch (error) {
-    console.error("Update task error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to update task.",
-    });
   }
-});
+);
 
-// DELETE /api/tasks/:id — delete only the logged-in user's task.
-router.delete("/:id", async (req: Request, res: Response): Promise<void> => {
-  try {
+// DELETE /api/tasks/:id
+router.delete(
+  "/:id",
+  async (req: Request, res: Response): Promise<void> => {
     const userId = getUserId(req);
-    const taskId = req.params.id;
 
     if (!userId) {
       res.status(401).json({
@@ -303,39 +314,35 @@ router.delete("/:id", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    if (!isValidObjectId(taskId)) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid task ID.",
+    const id = getValidTaskId(req, res);
+    if (!id) return;
+
+    try {
+      // Delete only if this task belongs to the authenticated user.
+      const result = await prisma.task.deleteMany({
+        where: { id, userId },
       });
-      return;
-    }
 
-    const task = await Task.findOneAndDelete({
-      _id: taskId,
-      userId,
-    });
+      if (result.count === 0) {
+        res.status(404).json({
+          success: false,
+          message: "Task not found.",
+        });
+        return;
+      }
 
-    if (!task) {
-      res.status(404).json({
-        success: false,
-        message: "Task not found.",
+      res.status(200).json({
+        success: true,
+        message: "Task deleted successfully.",
       });
-      return;
+    } catch (error) {
+      console.error("Delete task error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete task.",
+      });
     }
-
-    res.status(200).json({
-      success: true,
-      message: "Task deleted successfully.",
-    });
-  } catch (error) {
-    console.error("Delete task error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to delete task.",
-    });
   }
-});
+);
 
 export default router;

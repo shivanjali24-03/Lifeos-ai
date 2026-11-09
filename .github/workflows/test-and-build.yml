@@ -1,0 +1,59 @@
+name: test-and-build
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+
+jobs:
+  test-and-build:
+    name: test-and-build
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: lifeos
+          POSTGRES_PASSWORD: lifeos_test_password
+          POSTGRES_DB: lifeos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lifeos -d lifeos_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      NODE_ENV: test
+      PORT: 5000
+      DATABASE_URL: postgresql://lifeos:lifeos_test_password@localhost:5432/lifeos_test?schema=public
+      DIRECT_URL: postgresql://lifeos:lifeos_test_password@localhost:5432/lifeos_test?schema=public
+      CORS_ORIGIN: http://localhost:5173
+      JWT_SECRET: test-only-secret-at-least-32-characters-long
+      JWT_EXPIRES_IN: 15m
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install backend dependencies
+        working-directory: lifeos-ai_backend
+        run: npm install
+      - name: Generate Prisma client
+        working-directory: lifeos-ai_backend
+        run: npx prisma generate
+      - name: Apply database migrations
+        working-directory: lifeos-ai_backend
+        run: npx prisma migrate deploy
+      - name: Test backend
+        working-directory: lifeos-ai_backend
+        run: npm test
+      - name: Build backend
+        working-directory: lifeos-ai_backend
+        run: npm run build
+      - name: Install frontend dependencies
+        working-directory: lifeos-ai_frontend
+        run: npm install
+      - name: Build frontend
+        working-directory: lifeos-ai_frontend
+        run: npm run build

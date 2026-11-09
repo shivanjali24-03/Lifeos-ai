@@ -32,7 +32,7 @@ type Page =
 
 function mapApiTask(task: ApiTask): Task {
   return {
-    id: task._id,
+    id: task.id,
     title: task.title,
     category: "Personal",
     time: task.dueDate
@@ -150,7 +150,7 @@ function App() {
   const [focusSessions, setFocusSessions] = useState(0);
   const [focusSeconds, setFocusSeconds] = useState(0);
 
-  // Load tasks from the Express API backed by MongoDB.
+  // Load tasks from the Express API backed by PostgreSQL.
  
   // Load only the authenticated user's tasks.
   useEffect(() => {
@@ -262,7 +262,7 @@ function App() {
     };
   }, []);
 
-  // Update task completion in MongoDB.
+  // Update task completion in PostgreSQL.
   async function toggleTask(id: string) {
     const task = tasks.find((item) => item.id === id);
 
@@ -306,7 +306,7 @@ function App() {
     }
   }
 
-  // Create and save a task in MongoDB.
+  // Create and save a task in PostgreSQL.
   async function addTask() {
     const title = window.prompt("What would you like to do?");
 

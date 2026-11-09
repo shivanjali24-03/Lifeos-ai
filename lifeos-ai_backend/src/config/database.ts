@@ -1,13 +1,14 @@
-import mongoose from "mongoose";
+import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
+
+export const prisma = globalForPrisma.prisma ?? new PrismaClient({
+  log: process.env.NODE_ENV === "development" ? ["warn", "error"] : ["error"],
+});
+
+if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
 
 export async function connectDatabase(): Promise<void> {
-  const mongoUri = process.env.MONGODB_URI;
-
-  if (!mongoUri) {
-    throw new Error("MONGODB_URI is missing from the .env file");
-  }
-
-  await mongoose.connect(mongoUri);
-
-  console.log("MongoDB connected successfully");
+  await prisma.$connect();
+  console.log("PostgreSQL connected successfully");
 }
